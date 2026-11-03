@@ -112,6 +112,7 @@ def run(variant: str, dataset: str, fm: str, seed: int = 0, fm_tag: str = "",
         "betas": model.mnl.get_betas(),
         "analytical_trade_off": model.mnl.get_trade_off_ratio(),
         "audit": audit_result,
+        "fit": model.fit_info,
     }
 
     if save:

@@ -12,8 +12,12 @@ model starts as the plain multinomial logit.
 Two-stage training:
 
     Stage 1  g held at zero; fit the structural coefficients by maximum
-             likelihood (the multinomial logit).
-    Stage 2  structural coefficients frozen; fit g by maximum likelihood.
+             likelihood (the multinomial logit), to convergence on the
+             training rows (baselines/mnl.py:fit_mle).
+    Stage 2  structural coefficients frozen; fit g on the training NLL with
+             early stopping on validation NLL. A Stage 2 without g (only the
+             scalar alpha, ablation A1) is a parametric fit and also uses
+             fit_mle.
 
 Because q is precomputed, g adds nothing to any attribute derivative, so
 the trade-off ratios beta_attr / beta_cost are those of Stage 1
@@ -37,7 +41,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from tabfm_logit.baselines.mnl import (  # noqa: E402
-    MNL_SM, MNL_LPMC, MNL_IoT,
+    MNL_SM, MNL_LPMC, MNL_IoT, MAX_EPOCHS, fit_mle,
 )
 
 
@@ -178,11 +182,8 @@ def train_two_stage(
     dataset_name: str,
     X_tr, y_tr, fm_tr,
     X_vl, y_vl, fm_vl,
-    lr1: float = 0.01,
     lr2: float = 0.005,
-    epochs1: int = 500,
-    epochs2: int = 500,
-    patience1: int = 30,
+    epochs2: int = MAX_EPOCHS,
     patience2: int = 30,
     seed: int = 42,
     bootstrap: bool = True,
@@ -193,9 +194,15 @@ def train_two_stage(
     n_correction_layers: int = 2,
     mnl=None,
 ) -> TabFMLogit:
-    """Two-stage training (Stage 1: structural coefficients with g = 0;
-    Stage 2: g with the structural coefficients frozen). Both stages use Adam,
-    full batch, and keep the parameters with the lowest validation NLL.
+    """Two-stage training.
+
+    Stage 1: the structural coefficients with g = 0, by maximum likelihood on
+    the training rows, to convergence (``fit_mle``; validation rows unused).
+    Stage 2: g with the structural coefficients frozen, Adam (full batch,
+    learning rate ``lr2``), keeping the parameters with the lowest validation
+    NLL and stopping after ``patience2`` epochs without improvement. Without
+    g (ablation A1, only the scalar alpha) Stage 2 is also a maximum-likelihood
+    fit. How each stage ended is stored on the model (``fit_info``).
 
     With ``bootstrap=True`` the training rows are resampled with replacement
     (indices from ``seed``); this gives the training-bootstrap replicates.
@@ -224,21 +231,20 @@ def train_two_stage(
     yv = torch.tensor(y_vl, dtype=torch.long)
     qv = torch.tensor(fm_vl, dtype=torch.float32)
 
-    # Stage 1: utility-only. Freeze fm_params, train utility_params.
+    # Stage 1: the multinomial logit by maximum likelihood (g held at zero).
     for p in model.fm_params():
         p.requires_grad_(False)
     for p in model.utility_params():
         p.requires_grad_(True)
-    model, ep1 = _train_stage(
-        model, model.utility_params(),
-        Xt, yt, qt, Xv, yv, qv,
-        lr=lr1, epochs=epochs1, patience=patience1,
-    )
+    Xd, qd = Xt.double(), qt.double()
+    it1, g1 = fit_mle(model, model.utility_params(), lambda: model(Xd, qd), yt)
+    model.fit_info = {"stage1": {"method": "maximum likelihood, L-BFGS",
+                                 "iterations": it1, "max_abs_grad": g1}}
     if verbose:
         with torch.no_grad():
             preds = model.predict_proba(Xv, qv).argmax(dim=1).numpy()
         s1_acc = float(accuracy_score(y_vl, preds))
-        print(f"  stage 1 done in {ep1} epochs.  val_acc={s1_acc:.4f}")
+        print(f"  stage 1 (maximum likelihood): {it1} L-BFGS iterations, max |grad| {g1:.1e}.  val_acc={s1_acc:.4f}")
 
     # Stage 2: fm-only. Freeze utility_params, train fm_params.
     fm_params = model.fm_params()
@@ -247,16 +253,22 @@ def train_two_stage(
             p.requires_grad_(False)
         for p in fm_params:
             p.requires_grad_(True)
-        model, ep2 = _train_stage(
-            model, fm_params,
-            Xt, yt, qt, Xv, yv, qv,
-            lr=lr2, epochs=epochs2, patience=patience2,
-        )
+        if use_correction:
+            model, ep2 = _train_stage(
+                model, fm_params,
+                Xt, yt, qt, Xv, yv, qv,
+                lr=lr2, epochs=epochs2, patience=patience2,
+            )
+            model.fit_info["stage2"] = {"method": "Adam, early stopping on validation NLL", "epochs": ep2}
+        else:
+            ep2, g2 = fit_mle(model, fm_params, lambda: model(Xd, qd), yt)
+            model.fit_info["stage2"] = {"method": "maximum likelihood, L-BFGS",
+                                        "iterations": ep2, "max_abs_grad": g2}
         if verbose:
             with torch.no_grad():
                 preds = model.predict_proba(Xv, qv).argmax(dim=1).numpy()
             s2_acc = float(accuracy_score(y_vl, preds))
-            print(f"  stage 2 done in {ep2} epochs.  val_acc={s2_acc:.4f}  α={model.alpha.item():+.4f}")
+            print(f"  stage 2: {model.fit_info['stage2']}.  val_acc={s2_acc:.4f}  α={model.alpha.item():+.4f}")
     else:
         if verbose:
             print("  stage 2 skipped (no foundation-model parameters)")
@@ -269,7 +281,7 @@ def train_joint(
     X_tr, y_tr, fm_tr,
     X_vl, y_vl, fm_vl,
     lr: float = 0.01,
-    epochs: int = 1000,
+    epochs: int = MAX_EPOCHS,
     patience: int = 50,
     seed: int = 42,
     bootstrap: bool = True,
@@ -331,6 +343,7 @@ def train_joint(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    model.fit_info = {"joint": {"method": "Adam, early stopping on validation NLL", "epochs": epoch + 1}}
 
     if verbose:
         with torch.no_grad():

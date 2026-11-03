@@ -36,6 +36,7 @@ from tabfm_logit.audit import audit, CONFIGS as AUDIT_CONFIGS  # noqa: E402
 from tabfm_logit.baselines.monotonic_nn import (  # noqa: E402
     MonotonicMLP, cost_indices_for, split_features,
 )
+from tabfm_logit.baselines.mnl import MAX_EPOCHS  # noqa: E402
 
 OUT_DIR = ROOT / "results" / "monotonic_nn"
 PRED_DIR = ROOT / "results" / "predictions"
@@ -66,7 +67,7 @@ def _bootstrap_train(X, y, seed):
 
 def train(dataset: str, seed: int,
           hidden_g: int = 16, hidden_h: int = 32,
-          epochs: int = 500, lr: float = 5e-3,
+          epochs: int = MAX_EPOCHS, lr: float = 5e-3,
           patience: int = 30, weight_decay: float = 1e-4,
           verbose: bool = True):
     feats = DATASET_FEATURES[dataset]

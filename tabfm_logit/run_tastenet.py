@@ -36,6 +36,7 @@ from tabfm_logit.audit import audit, CONFIGS as AUDIT_CONFIGS  # noqa: E402
 from tabfm_logit.baselines.tastenet import (  # noqa: E402
     CLASSES, FEATURES, SUMMARIZERS, _select_by_val,
 )
+from tabfm_logit.baselines.mnl import MAX_EPOCHS  # noqa: E402
 
 OUT_DIR = ROOT / "results" / "tastenet"
 PRED_DIR = ROOT / "results" / "predictions"
@@ -43,7 +44,7 @@ PRED_DIR = ROOT / "results" / "predictions"
 
 def run(dataset: str, seed: int,
         hidden_grid=(20, 40, 80), l2_grid=(0.0, 1e-3),
-        lr: float = 0.01, epochs: int = 1000, patience: int = 50,
+        lr: float = 0.01, epochs: int = MAX_EPOCHS, patience: int = 50,
         save: bool = True, verbose: bool = True):
     if dataset not in CLASSES:
         raise ValueError(f"Unknown dataset: {dataset}")
@@ -120,6 +121,8 @@ def run(dataset: str, seed: int,
                 "val_nll": sel["val_nll"],
                 "selected_hidden": sel["hidden"],
                 "selected_l2": sel["l2"],
+                "epochs": sel["epochs"],
+                "epochs_all_configs": sel["epochs_all"],
                 "population_mean_betas": betas,
                 "trade_off_ratio_summary": trade_off,
                 "audit": audit_result,
@@ -159,7 +162,7 @@ if __name__ == "__main__":
     p.add_argument("--hidden-grid", type=int, nargs="+", default=[20, 40, 80])
     p.add_argument("--l2-grid", type=float, nargs="+", default=[0.0, 1e-3])
     p.add_argument("--lr", type=float, default=0.01)
-    p.add_argument("--epochs", type=int, default=1000)
+    p.add_argument("--epochs", type=int, default=MAX_EPOCHS)
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--no-save", action="store_true")
     p.add_argument("--quiet", action="store_true", help="suppress per-epoch chatter")

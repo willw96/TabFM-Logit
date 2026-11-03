@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
@@ -32,11 +33,15 @@ from tabfm_logit.baselines.feature_augmented_mnl import (  # noqa: E402
 
 
 def _predict_fn(model: FeatureAugmentedMNL, fm_probs: np.ndarray):
-    fm_t = torch.tensor(fm_probs, dtype=torch.float32)
+    """Predictions for the audit, in float64. The model is monotone by
+    construction; when a fitted cost coefficient is (near) zero, float32
+    rounding would otherwise register as spurious violations."""
+    m64 = copy.deepcopy(model).double()
+    fm_t = torch.tensor(fm_probs, dtype=torch.float64)
     def _fn(X):
         with torch.no_grad():
-            X_t = torch.tensor(X, dtype=torch.float32)
-            return torch.exp(model(X_t, fm_t)).numpy()
+            X_t = torch.tensor(X, dtype=torch.float64)
+            return torch.exp(m64(X_t, fm_t)).numpy()
     return _fn
 
 
@@ -94,6 +99,7 @@ def run(dataset: str, fm: str, seed: int = 0, save: bool = True, verbose: bool =
         "betas": betas,
         "analytical_trade_off": trade_off,
         "audit": audit_result,
+        "fit": model.fit_info,
     }
 
     if save:

@@ -21,8 +21,14 @@ over replicates.
 
 Output: results/counterfactual/frontier.json
 
-Usage (GPU):
+Usage (foundation-model environment, GPU for Mitra):
     python -m tabfm_logit.frontier --dataset swissmetro --fm mitra
+
+The foundation-model predictions can also be computed and used separately:
+    python -m tabfm_logit.frontier --dataset lpmc --fm mitra --save-q q.npz   (FM environment; no TabFM-Logit models needed)
+    python -m tabfm_logit.frontier --dataset lpmc --fm mitra --load-q q.npz   (CPU environment; no foundation model needed)
+The file holds q_base ("base"), q_pert ("pert__{scenario}__{10,20,50}") and the
+value-of-time perturbations ("t__{alt}", "c__{alt}") for the test rows.
 """
 from __future__ import annotations
 
@@ -37,9 +43,8 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tabfm_logit.data import load_splits, get_Xy  # noqa: E402
+from tabfm_logit.data import load_splits, get_Xy, DATASET_FEATURES  # noqa: E402
 from tabfm_logit.counterfactual import SCENARIOS, load_tabfm_logit, perturb_cost  # noqa: E402
-from tabfm_logit.fm.refit import fit_predict  # noqa: E402
 
 OUT_PATH = ROOT / "results" / "counterfactual" / "frontier.json"
 LAMBDAS = [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -66,13 +71,39 @@ def utilities(model, X_np, q_np):
     return V.numpy()
 
 
-def run_cell(dataset: str, fm: str, seeds=range(10), fm_tag: str = "xfit5") -> list[dict]:
-    models = [(s, load_tabfm_logit(dataset, fm, s, fm_tag)) for s in seeds]
-    print(f"\n=== {dataset} / {fm}: fitting the foundation model once ===", flush=True)
-    predict, features = fit_predict(dataset, fm)
+def _test_inputs(dataset: str):
+    features = DATASET_FEATURES[dataset]
     _, _, test = load_splits(dataset)
     X_te, _ = get_Xy(test, features)
-    q_base = predict(X_te)
+    return X_te, features
+
+
+def fm_inputs(dataset: str, fm: str) -> dict[str, np.ndarray]:
+    """Refit the foundation model once and predict every input the frontier uses."""
+    from tabfm_logit.fm.refit import fit_predict
+
+    print(f"\n=== {dataset} / {fm}: fitting the foundation model once ===", flush=True)
+    predict, _ = fit_predict(dataset, fm)
+    X_te, features = _test_inputs(dataset)
+    q = {"base": predict(X_te)}
+    for label, cost_col, _, _ in SCENARIOS[dataset]:
+        ci = features.index(cost_col)
+        for delta in DELTAS:
+            q[f"pert__{label}__{round(100 * delta)}"] = predict(perturb_cost(X_te, ci, delta))
+    for alt, (tcol, ccol) in TIME_COST_COLS.get(dataset, {}).items():
+        X_t = X_te.copy(); X_t[:, features.index(tcol)] += MRS_DELTA
+        X_c = X_te.copy(); X_c[:, features.index(ccol)] += MRS_DELTA
+        q[f"t__{alt}"], q[f"c__{alt}"] = predict(X_t), predict(X_c)
+    return q
+
+
+def run_cell(dataset: str, fm: str, q: dict[str, np.ndarray], seeds=range(10),
+             fm_tag: str = "xfit5") -> list[dict]:
+    models = [(s, load_tabfm_logit(dataset, fm, s, fm_tag)) for s in seeds]
+    X_te, features = _test_inputs(dataset)
+    q_base = q["base"]
+    if q_base.shape[0] != len(X_te):
+        raise ValueError(f"q has {q_base.shape[0]} rows, the test split has {len(X_te)}")
     share_pre = {s: m.predict_proba_np(X_te, q_base) for s, m in models}
     records = []
 
@@ -80,7 +111,7 @@ def run_cell(dataset: str, fm: str, seeds=range(10), fm_tag: str = "xfit5") -> l
         ci = features.index(cost_col)
         for delta in DELTAS:
             X_p = perturb_cost(X_te, ci, delta)
-            q_p = predict(X_p)
+            q_p = q[f"pert__{label}__{round(100 * delta)}"]
             curve = []
             for lam in LAMBDAS:
                 q_l = (1.0 - lam) * q_base + lam * q_p
@@ -101,7 +132,7 @@ def run_cell(dataset: str, fm: str, seeds=range(10), fm_tag: str = "xfit5") -> l
     for alt, (tcol, ccol) in TIME_COST_COLS.get(dataset, {}).items():
         X_t = X_te.copy(); X_t[:, features.index(tcol)] += MRS_DELTA
         X_c = X_te.copy(); X_c[:, features.index(ccol)] += MRS_DELTA
-        q_t, q_c = predict(X_t), predict(X_c)
+        q_t, q_c = q[f"t__{alt}"], q[f"c__{alt}"]
         curve = []
         for lam in LAMBDAS:
             qt_l = (1.0 - lam) * q_base + lam * q_t
@@ -138,10 +169,23 @@ if __name__ == "__main__":
     p.add_argument("--dataset", required=True, choices=list(SCENARIOS))
     p.add_argument("--fm", required=True, choices=["mitra", "tabpfn"])
     p.add_argument("--fm-tag", default="xfit5")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--save-q", help="compute the foundation-model inputs, save them to this .npz and stop")
+    g.add_argument("--load-q", help="use foundation-model inputs saved with --save-q instead of refitting")
     a = p.parse_args()
+    if a.load_q:
+        with np.load(a.load_q) as z:
+            q = {k: z[k] for k in z.files}
+    else:
+        q = fm_inputs(a.dataset, a.fm)
+    if a.save_q:
+        Path(a.save_q).parent.mkdir(parents=True, exist_ok=True)
+        np.savez(a.save_q, **q)
+        print(f"saved {a.save_q} ({len(q)} arrays)")
+        sys.exit(0)
     out = json.loads(OUT_PATH.read_text()) if OUT_PATH.exists() else []
     out = [r for r in out if not (r["dataset"] == a.dataset and r["fm"] == a.fm)]
-    out.extend(run_cell(a.dataset, a.fm, fm_tag=a.fm_tag))
+    out.extend(run_cell(a.dataset, a.fm, q, fm_tag=a.fm_tag))
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(out, indent=2))
     print(f"saved {OUT_PATH} ({len(out)} records)")

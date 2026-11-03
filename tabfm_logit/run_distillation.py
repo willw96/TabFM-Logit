@@ -5,8 +5,8 @@ foundation model's cross-fitted training-row probabilities q.
     pure    loss = soft-target cross-entropy against q
     mixed   loss = 0.5 * NLL(true labels) + 0.5 * soft-target cross-entropy
 
-Early stopping uses the true-label validation NLL (Adam, full batch, up to
-500 epochs, patience 30); q never touches validation or test. Five
+Early stopping uses the true-label validation NLL (Adam, full batch, patience
+30); q never touches validation or test. Five
 training-bootstrap replicates per cell. The student is a multinomial logit,
 so every structural guarantee holds by construction.
 
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from tabfm_logit.data import load_splits, get_Xy  # noqa: E402
-from tabfm_logit.baselines.mnl import CLASSES, FEATURES  # noqa: E402
+from tabfm_logit.baselines.mnl import CLASSES, FEATURES, MAX_EPOCHS  # noqa: E402
 from tabfm_logit.predictions import load_fm_probs  # noqa: E402
 
 OUT_PATH = ROOT / "results" / "baselines" / "distillation.json"
@@ -43,7 +43,7 @@ def _bootstrap(seed, *arrays):
     return [np.asarray(a)[idx] for a in arrays]
 
 
-def train_kd(dataset, X_tr, y_tr, q_tr, X_vl, y_vl, mode, lr=0.01, epochs=500, patience=30):
+def train_kd(dataset, X_tr, y_tr, q_tr, X_vl, y_vl, mode, lr=0.01, epochs=MAX_EPOCHS, patience=30):
     model = CLASSES[dataset]()
     X_t, y_t = torch.tensor(X_tr, dtype=torch.float32), torch.tensor(y_tr, dtype=torch.long)
     q_t = torch.tensor(q_tr, dtype=torch.float32)
@@ -51,7 +51,7 @@ def train_kd(dataset, X_tr, y_tr, q_tr, X_vl, y_vl, mode, lr=0.01, epochs=500, p
     opt = optim.Adam(model.parameters(), lr=lr)
     nll = torch.nn.NLLLoss()
     best, best_state, wait = float("inf"), None, 0
-    for _ in range(epochs):
+    for epoch in range(epochs):
         model.train()
         opt.zero_grad()
         logp = model(X_t)
@@ -71,6 +71,7 @@ def train_kd(dataset, X_tr, y_tr, q_tr, X_vl, y_vl, mode, lr=0.01, epochs=500, p
                 break
     if best_state is not None:
         model.load_state_dict(best_state)
+    model.epochs_trained = epoch + 1
     return model
 
 
@@ -84,17 +85,19 @@ def main():
         X_te, y_te = get_Xy(test_df, feats)
         q_tr = load_fm_probs(dataset, fm, "train", len(train_df), fm_tag="xfit5")
         for mode in ("pure", "mixed"):
-            accs = []
+            accs, epochs = [], []
             for seed in SEEDS:
                 torch.manual_seed(seed)
                 Xb, yb, qb = _bootstrap(seed, X_tr, y_tr, q_tr)
                 model = train_kd(dataset, Xb, yb, qb, X_vl, y_vl, mode)
+                epochs.append(model.epochs_trained)
                 model.eval()
                 with torch.no_grad():
                     probs = model.predict_proba(torch.tensor(X_te, dtype=torch.float32)).numpy()
                 accs.append(float((probs.argmax(1) == y_te).mean()))
             out.append({"dataset": dataset, "fm": fm, "mode": mode, "n_seeds": len(accs),
-                        "test_acc_mean": float(np.mean(accs)), "test_acc_std": float(np.std(accs, ddof=1))})
+                        "test_acc_mean": float(np.mean(accs)), "test_acc_std": float(np.std(accs, ddof=1)),
+                        "epochs": epochs})
             print(f"  {dataset:14s} {fm:7s} {mode:5s} accuracy {np.mean(accs):.4f}")
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(out, indent=2))
