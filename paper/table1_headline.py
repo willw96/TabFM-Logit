@@ -88,16 +88,32 @@ def tastenet_row(ds):
             100 * min(j["audit"]["monotonicity_avg"] for j in J), trade, ece_best(pairs))
 
 
+COST_KEY = {"swissmetro": "beta_co", "lpmc": "b_cost", "iot_wearables": "beta_price"}
+ZERO_BOUND = 1e-3  # cost coefficient below this fraction of the MNL's: at its zero bound
+
+
+def feature_aug_collapse(ds, fm, J):
+    """Per replicate, the feature-augmented cost coefficient over the Stage 1
+    (MNL) one fitted on the same bootstrap sample."""
+    k = COST_KEY[ds]
+    return np.array([j["betas"][k] / run_json("tabfm_logit", ds, fm, s)["betas"][k] for s, j in zip(SEEDS, J)])
+
+
 def feature_aug_row(ds, fm):
+    """Trade-off: median over replicates, with ^n = replicates whose cost
+    coefficient is at its zero bound (ratio undefined)."""
     J = [json.loads((RES / "feature_aug" / f"feature_aug_{ds}_{fm}_xfit5_seed{s}.json").read_text()) for s in SEEDS]
     pairs = []
     for s in SEEDS:
         v = np.load(PRED / f"feature_aug_{ds}_{fm}_xfit5_seed{s}_val.npz")
         t = np.load(PRED / f"feature_aug_{ds}_{fm}_xfit5_seed{s}_test.npz")
         pairs.append((v["probs_feature_aug"], v["labels"], t["probs_feature_aug"], t["labels"]))
-    to = mean_dict([{k: x for k, x in j["analytical_trade_off"].items() if k != "vot"} for j in J])
+    tos = [{k: x for k, x in j["analytical_trade_off"].items() if k != "vot"} for j in J]
+    med = {k: float(np.median([d[k] for d in tos])) for k in tos[0]}
+    n0 = int((feature_aug_collapse(ds, fm, J) < ZERO_BOUND).sum())
+    trade = fmt_trade(ds, med) + (f"^{n0}" if n0 else "")
     return (100 * np.mean([j["test_accuracy"] for j in J]),
-            100 * min(j["audit"]["monotonicity_avg"] for j in J), fmt_trade(ds, to), ece_best(pairs), J)
+            100 * min(j["audit"]["monotonicity_avg"] for j in J), trade, ece_best(pairs), J)
 
 
 def tabfm_logit_row(ds, fm):
@@ -139,11 +155,14 @@ if __name__ == "__main__":
         show("feat-aug", fa)
         ad = [tabfm_logit_row(ds, fm) if (ds, fm) in reported else None for fm in FMS]
         show("TabFM-Logit", ad)
+        for fm, row in zip(FMS, fa):
+            if row is None:
+                continue
+            r = feature_aug_collapse(ds, fm, row[4])
+            print(f"    feat-aug {NAMES[fm]}: cost coefficient at its zero bound in {int((r < ZERO_BOUND).sum())}/10 "
+                  f"replicates; cost coefficient over the MNL's: median {np.median(r):.2f}, "
+                  f"range {r.min():.1e} to {r.max():.2f}")
         if ds == "swissmetro":
-            for fm, row in zip(FMS, fa):
-                v = [j["analytical_trade_off"]["vot_chf_per_hr"] for j in row[4]]
-                print(f"    feat-aug {NAMES[fm]} value of time over replicates: {min(v):.0f} to {max(v):.0f} CHF/hr, "
-                      f"mean {np.mean(v):.0f} +- {np.std(v, ddof=1):.0f}")
             v = [j["analytical_trade_off"]["vot_chf_per_hr"] for j in ad[0][4]]
             print(f"    TabFM-Logit value of time: {np.mean(v):.1f} +- {np.std(v, ddof=1):.1f} CHF/hr")
         if ds == "lpmc":
