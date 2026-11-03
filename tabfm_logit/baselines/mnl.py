@@ -9,8 +9,10 @@ TabFM-Logit captures the remaining heterogeneity.
 
 Module exports:
     MNL_SM, MNL_LPMC, MNL_IoT   torch.nn.Module classes
-    train_mnl                   training loop with early stopping
+    fit_mle                     exact maximum-likelihood fit (L-BFGS, float64)
+    train_mnl                   maximum-likelihood fit of a multinomial logit
     run_mnl                     train and evaluate on one dataset
+    MAX_EPOCHS                  iteration limit shared by every fit in the repository
 """
 import sys
 from pathlib import Path
@@ -18,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -27,6 +30,12 @@ from tabfm_logit.data import (  # noqa: E402
     load_splits, get_Xy,
     SM_FEATURES, LPMC_FEATURES, IOT_WEARABLES_FEATURES,
 )
+
+# Upper bound on epochs (or L-BFGS iterations) for every fit in this
+# repository. Neural fits stop when their validation NLL has not improved for
+# ``patience`` epochs and maximum-likelihood fits stop at convergence, both
+# long before this bound; it only guards against a fit that never stops.
+MAX_EPOCHS = 50_000
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -298,49 +307,94 @@ FEATURES = {
 }
 
 
-def train_mnl(model, X_train, y_train, X_val, y_val,
-              lr=0.01, epochs=500, patience=30, verbose=False):
-    """NLL training with early stopping on validation loss."""
-    X_t = torch.tensor(X_train, dtype=torch.float32)
-    y_t = torch.tensor(y_train, dtype=torch.long)
-    X_v = torch.tensor(X_val, dtype=torch.float32)
-    y_v = torch.tensor(y_val, dtype=torch.long)
-
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.NLLLoss()
-
-    best_loss = float("inf")
-    best_state = None
-    wait = 0
-
-    for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        loss = criterion(model(X_t), y_t)
-        loss.backward()
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            vloss = criterion(model(X_v), y_v).item()
-        if vloss < best_loss - 1e-6:
-            best_loss = vloss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            wait = 0
-        else:
-            wait += 1
-        if wait >= patience:
+def _newton(params, loss_fn, max_iter=500, grad_tol=1e-8):
+    """Damped Newton (Levenberg-Marquardt) on a small parameter vector, with
+    the exact Hessian. Reliable on the flat likelihood ridges that first-order
+    methods crawl along. Returns the number of accepted steps."""
+    n = sum(p.numel() for p in params)
+    lam, steps = 1e-6, 0
+    for _ in range(max_iter):
+        loss = loss_fn()
+        g = torch.cat([x.reshape(-1) for x in torch.autograd.grad(loss, params, create_graph=True)])
+        if float(g.detach().abs().max()) < grad_tol:
             break
+        H = torch.stack([torch.cat([x.reshape(-1) for x in
+                                    torch.autograd.grad(g[i], params, retain_graph=True)])
+                         for i in range(n)])
+        g, H, f0 = g.detach(), H.detach(), loss.item()
+        accepted = False
+        while lam < 1e12:
+            step = torch.linalg.solve(H + lam * torch.eye(n, dtype=H.dtype), -g)
+            with torch.no_grad():
+                i = 0
+                for p in params:
+                    p += step[i:i + p.numel()].reshape(p.shape)
+                    i += p.numel()
+                f1 = float(loss_fn())
+                if f1 <= f0:
+                    accepted = True
+                    lam = max(lam / 10, 1e-12)
+                    break
+                i = 0
+                for p in params:
+                    p -= step[i:i + p.numel()].reshape(p.shape)
+                    i += p.numel()
+            lam *= 10
+        if not accepted:
+            break
+        steps += 1
+    return steps
 
-        if verbose and epoch % 50 == 0:
-            print(f"  epoch {epoch:>3d}  train_nll={loss.item():.4f}  val_nll={vloss:.4f}")
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+def fit_mle(module, params, log_prob_fn, y, lbfgs_iter=2000):
+    """Maximum-likelihood fit of ``params`` (parameters of ``module``): the
+    training log-likelihood is maximized to convergence, in float64, by
+    full-batch L-BFGS (strong-Wolfe line search) followed by damped Newton
+    steps with the exact Hessian until the largest gradient entry is below
+    1e-8. ``log_prob_fn()`` returns the (N, K) log-probabilities from float64
+    inputs. No validation data is used. The module is returned to float32.
+
+    Returns (L-BFGS iterations + Newton steps, largest absolute gradient of the
+    mean NLL at the end).
+    """
+    module.double()
+    y = torch.as_tensor(np.asarray(y), dtype=torch.long)
+    loss_fn = lambda: F.nll_loss(log_prob_fn(), y)  # noqa: E731
+    opt = optim.LBFGS(params, lr=1.0, max_iter=lbfgs_iter, max_eval=2 * lbfgs_iter,
+                      tolerance_grad=1e-9, tolerance_change=1e-12, history_size=100,
+                      line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        loss = loss_fn()
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    state = opt.state_dict()["state"]
+    n_iter = int(state[0]["n_iter"]) if state else 0
+    for p in params:
+        p.grad = None
+    n_iter += _newton(params, loss_fn)
+    grads = torch.autograd.grad(loss_fn(), params)
+    grad_max = max(float(x.abs().max()) for x in grads)
+    module.float()
+    return n_iter, grad_max
+
+
+def train_mnl(model, X_train, y_train, X_val=None, y_val=None, verbose=False):
+    """Maximum-likelihood fit on the training rows (see ``fit_mle``); the
+    validation arguments are accepted for API compatibility and not used."""
+    X_t = torch.tensor(np.asarray(X_train), dtype=torch.float64)
+    n_iter, grad_max = fit_mle(model, list(model.parameters()),
+                               lambda: torch.log_softmax(model.utilities(X_t), dim=1), y_train)
+    model.fit_iterations, model.fit_max_abs_grad = n_iter, grad_max
+    if verbose:
+        print(f"  maximum likelihood: {n_iter} L-BFGS iterations, max |grad| {grad_max:.1e}")
     return model
 
 
-def run_mnl(dataset_name, lr=0.01, epochs=500, patience=30, verbose=False):
+def run_mnl(dataset_name, verbose=False):
     """Train MNL for a dataset, return (model, test_metrics, betas, trade_off)."""
     if dataset_name not in CLASSES:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -351,8 +405,7 @@ def run_mnl(dataset_name, lr=0.01, epochs=500, patience=30, verbose=False):
     X_te, y_te = get_Xy(test, feats)
 
     model = CLASSES[dataset_name]()
-    model = train_mnl(model, X_tr, y_tr, X_vl, y_vl, lr=lr, epochs=epochs,
-                      patience=patience, verbose=verbose)
+    model = train_mnl(model, X_tr, y_tr, X_vl, y_vl, verbose=verbose)
 
     model.eval()
     with torch.no_grad():

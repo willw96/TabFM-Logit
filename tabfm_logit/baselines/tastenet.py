@@ -39,6 +39,7 @@ from tabfm_logit.data import (  # noqa: E402
     load_splits, get_Xy,
     SM_FEATURES, LPMC_FEATURES, IOT_WEARABLES_FEATURES,
 )
+from tabfm_logit.baselines.mnl import MAX_EPOCHS  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -353,9 +354,10 @@ SUMMARIZERS = {
 
 
 def train_tastenet(model, X_train, y_train, X_val, y_val,
-                   lr=0.01, weight_decay=0.0, epochs=1000, patience=50,
+                   lr=0.01, weight_decay=0.0, epochs=MAX_EPOCHS, patience=50,
                    verbose=False):
-    """NLL + L2 training with early stopping on val NLL.
+    """NLL + L2 training with early stopping on val NLL (the epoch count is
+    stored on the model as ``epochs_trained``).
 
     weight_decay=0.0 matches Han 2022's best Swissmetro configuration
     (no L2). Adam's built-in weight_decay applies L2 to every parameter,
@@ -398,14 +400,16 @@ def train_tastenet(model, X_train, y_train, X_val, y_val,
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    model.epochs_trained = epoch + 1
     return model, best_loss
 
 
 def _select_by_val(dataset_name, X_tr, y_tr, X_vl, y_vl,
                    hidden_grid=(20, 40, 80), l2_grid=(0.0, 1e-3),
-                   lr=0.01, epochs=1000, patience=50, verbose=False):
+                   lr=0.01, epochs=MAX_EPOCHS, patience=50, verbose=False):
     """Han-style hyperparameter selection on the val split (lowest val NLL)."""
-    best = {"val_nll": float("inf"), "hidden": None, "l2": None, "model": None}
+    best = {"val_nll": float("inf"), "hidden": None, "l2": None, "model": None,
+            "epochs": None, "epochs_all": []}
     for h in hidden_grid:
         for l2 in l2_grid:
             model = CLASSES[dataset_name](hidden=h, activation="relu")
@@ -414,16 +418,17 @@ def _select_by_val(dataset_name, X_tr, y_tr, X_vl, y_vl,
                 lr=lr, weight_decay=l2, epochs=epochs, patience=patience,
                 verbose=verbose,
             )
+            best["epochs_all"].append(model.epochs_trained)
             if verbose:
                 print(f"  [select] hidden={h:3d} l2={l2:.0e} → val_nll={vloss:.4f}")
             if vloss < best["val_nll"] - 1e-6:
-                best.update(val_nll=vloss, hidden=h, l2=l2, model=model)
+                best.update(val_nll=vloss, hidden=h, l2=l2, model=model, epochs=model.epochs_trained)
     return best
 
 
 def run_tastenet(dataset_name, seed=42,
                  hidden_grid=(20, 40, 80), l2_grid=(0.0, 1e-3),
-                 lr=0.01, epochs=1000, patience=50, verbose=False):
+                 lr=0.01, epochs=MAX_EPOCHS, patience=50, verbose=False):
     """Train TasteNet for a dataset, return (metrics_dict, model, per_obs_betas).
 
     metrics_dict has the same keys as `mnl.run_mnl` so downstream tables
