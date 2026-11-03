@@ -8,8 +8,8 @@ Tabular foundation models such as TabPFN and Mitra predict discrete choices accu
 V_k(x) = V_k^struct(x) + g_k(q(x))
 ```
 
-- **Stage 1** fits the structural coefficients of the multinomial logit by maximum likelihood, with sign constraints on time and cost, and with g held at zero.
-- **Stage 2** freezes them and fits the small correction network g on the foundation model's predictions, which are computed once and held fixed.
+- **Stage 1** fits the structural coefficients of the multinomial logit by maximum likelihood, to convergence, with sign constraints on time and cost, and with g held at zero.
+- **Stage 2** freezes them and fits the small correction network g on the foundation model's predictions, which are computed once and held fixed (early stopping on validation NLL).
 
 Because q is precomputed, g contributes nothing to any attribute derivative. Trade-off ratios such as the value of time are therefore exactly those of the multinomial logit, and cost monotonicity and zero probability on unavailable alternatives hold by construction. The foundation model contributes accuracy on observed choices.
 
@@ -60,7 +60,7 @@ Run from the repository root, in order. Outputs go to `results/`.
 | 2 | `scripts/2_fm_predictions.sh` | GPU | Mitra and TabPFN predictions: in-context, cross-fitted (5 folds; group folds on the grouped splits), and restricted-context runs for ablation A4 |
 | 3 | `scripts/3_audit_raw_fm.sh` | GPU | behavioral audit of the raw foundation models |
 | 4 | `scripts/4_train.sh` | CPU, parallel | TabFM-Logit (10 training-bootstrap replicates per cell), its ablations, the feature-augmented MNL, monotonic neural network, TasteNet, knowledge distillation, fixed-q counterfactuals |
-| 5 | `scripts/5_frontier.sh` | GPU | recomputed and partial q: refits each foundation model once and evaluates perturbed inputs |
+| 5 | `scripts/5_frontier.sh` | GPU | recomputed and partial q: refits each foundation model once and evaluates perturbed inputs (`--save-q` / `--load-q` split the GPU and CPU parts) |
 | 6 | `scripts/6_paper.sh` | CPU, minutes | prints every table and quoted number, and writes the figure |
 
 The full pipeline took roughly 20 GPU-hours and 30 CPU-hours. TabPFN is not run on LPMC, whose train+validation context is outside TabPFN's supported size range.
